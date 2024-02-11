@@ -42,12 +42,12 @@ class RonDBEngine:
             },
         }
 
-    def get_feature_vector(self, fv_name: str, fv_version: int, primary_key: str):
+    def get_raw_feature_vector(self, fv_name: str, fv_version: int, primary_key: str):
         payload = self.payload_default_builder(fv_name, fv_version)
         payload["entries"] = {"id1": primary_key}
         return self._rondb_api.get_feature_vector(self._API_VERSION, payload)
 
-    def get_feature_vectors(
+    def get_raw_feature_vectors(
         self, fv_name: str, fv_version: int, primary_keys: list[str]
     ):
         payload = self.payload_default_builder(fv_name, fv_version)
