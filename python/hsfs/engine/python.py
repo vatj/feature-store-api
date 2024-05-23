@@ -206,7 +206,6 @@ class Engine:
         hive_config: Optional[Dict[str, Any]] = None,
         arrow_flight_config: Optional[Dict[str, Any]] = None,
     ) -> Union[pd.DataFrame, pl.DataFrame]:
-
         self._validate_dataframe_type(dataframe_type)
         if isinstance(sql_query, dict) and "query_string" in sql_query:
             result_df = util.run_with_loading_animation(
@@ -510,7 +509,12 @@ class Engine:
             sql_query, feature_store, online_conn, "default", read_options or {}
         ).head(n)
 
-    def read_vector_db(self, feature_group: "hsfs.feature_group.FeatureGroup", n: int =None, dataframe_type: str="default") -> Union[pd.DataFrame, pl.DataFrame, np.ndarray, List[List[Any]]]:
+    def read_vector_db(
+        self,
+        feature_group: "hsfs.feature_group.FeatureGroup",
+        n: int = None,
+        dataframe_type: str = "default",
+    ) -> Union[pd.DataFrame, pl.DataFrame, np.ndarray, List[List[Any]]]:
         dataframe_type = dataframe_type.lower()
         self._validate_dataframe_type(dataframe_type)
 
@@ -805,6 +809,55 @@ class Engine:
             "Training dataset creation from Dataframes is not "
             + "supported in Python environment. Use HSFS Query object instead."
         )
+
+    def check_df_primary_keys_for_null_values(
+        self, primary_keys: List[str], dataframe: Union[pd.DataFrame, pl.DataFrame]
+    ):
+        """Check if the primary keys in the dataframe have any null values.
+
+        :param primary_keys: The primary keys of the dataframe
+        :type primary_keys: `List[str]`
+        :param dataframe: The dataframe to check
+        :type dataframe: `pd.DataFrame`
+        :return: True if the primary keys have null values, False otherwise
+        :rtype: `bool`
+        """
+        null_counts = {}
+        arrow_schema = pa.Schema.from_pandas(dataframe, preserve_index=False)
+        for key in primary_keys:
+            if arrow_schema.field(key).nullable:
+                null_count = dataframe[key].isnull().sum()
+                if null_count > 0:
+                    null_counts[key] = null_count
+
+        if len(null_counts) > 0:
+            raise ValueError(
+                f"Found null values in primary keys: {null_counts}. Aborting insertion."
+                "To disable automatic primary key check, set `check_primary_key=False` "
+                "in the validation_options of the `insert` method."
+            )
+
+        return False
+
+    def check_max_string_length(
+        self,
+        dataframe: Union[pd.DataFrame, pl.DataFrame],
+        features: List[feature.Feature],
+        adjust: bool = False,
+    ):
+        for feat in features:
+            if feat.type == "string":
+                if isinstance(dataframe, pl.DataFrame) or isinstance(
+                    dataframe, pl.dataframe.frame.DataFrame
+                ):
+                    max_length = dataframe[feat.name].str_lengths().max()
+                else:
+                    max_length = dataframe[feat.name].str.len().max()
+                if max_length > 255:
+                    raise ValueError(
+                        f"Feature '{feat.name}' has a maximum string length of {max_length}. "
+                        "The maximum allowed string length is 255 characters. Aborting insertion."
+                    )
 
     def save_dataframe(
         self,

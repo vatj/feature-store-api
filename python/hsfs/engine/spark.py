@@ -152,7 +152,14 @@ class Engine:
             sql_query, feature_store, online_conn, "default", read_options
         ).show(n)
 
-    def read_vector_db(self, feature_group: fg_mod.FeatureGroup, n: int =None, dataframe_type: str="default") -> Union[pd.DataFrame, np.ndarray, List[List[Any]], TypeVar("pyspark.sql.DataFrame")]:
+    def read_vector_db(
+        self,
+        feature_group: fg_mod.FeatureGroup,
+        n: int = None,
+        dataframe_type: str = "default",
+    ) -> Union[
+        pd.DataFrame, np.ndarray, List[List[Any]], TypeVar("pyspark.sql.DataFrame")
+    ]:
         results = VectorDbClient.read_feature_group(feature_group, n)
         feature_names = [f.name for f in feature_group.features]
         dataframe_type = dataframe_type.lower()
@@ -539,6 +546,42 @@ class Engine:
                 ).alias("value"),
             ]
         )
+
+    def check_spark_df_primary_keys_for_null_values(
+        self,
+        primary_keys: List[str],
+        dataframe: Union[TypeVar("pyspark.sql.DataFrame"), TypeVar("pyspark.rdd.RDD")],
+    ):
+        """Check if the primary keys in the dataframe have any null values.
+
+        :param primary_keys: The primary keys of the dataframe
+        :type primary_keys: `List[str]`
+        :param dataframe: The dataframe to check
+        :type dataframe: `pd.DataFrame`
+        :return: True if the primary keys have null values, False otherwise
+        :rtype: `bool`
+        """
+        null_counts = {}
+        pk_types = [dataframe.schema[key].dataType.typeName() for key in primary_keys]
+        for key, dtype in zip(primary_keys, pk_types):
+            if dtype == "string":
+                null_count = dataframe.filter(
+                    col(key).isNull() | (col(key) == "")
+                ).count()
+            else:
+                null_count = dataframe.filter(col(key).isNull()).count()
+
+            if null_count > 0:
+                null_counts[key] = null_count
+
+        if len(null_counts) > 0:
+            raise ValueError(
+                f"Found null or empty values in primary keys: {null_counts}. Aborting insertion."
+                "To disable automatic primary key check, set `check_primary_key=False` "
+                "in the validation_options of the `insert` method."
+            )
+
+        return False
 
     def get_training_data(
         self,
@@ -1324,7 +1367,7 @@ class Engine:
 
     @staticmethod
     def _convert_offline_type_to_spark_type(offline_type):
-        if "array<" == offline_type[:6]:
+        if offline_type.startswith("array<"):
             return ArrayType(
                 Engine._convert_offline_type_to_spark_type(offline_type[6:-1])
             )
