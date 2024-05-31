@@ -27,6 +27,7 @@ import avro.schema
 import numpy as np
 import pandas as pd
 import polars as pl
+from dateutil.parser import parse
 from hsfs import (
     client,
     feature_view,
@@ -778,7 +779,16 @@ class VectorServer:
             ).replace(tzinfo=None)
         elif isinstance(timestamp_value, str):
             # rest client returns timestamp as string
-            return datetime.strptime(timestamp_value, self.SQL_TIMESTAMP_STRING_FORMAT)
+            try:
+                datetime.strptime(timestamp_value, self.SQL_TIMESTAMP_STRING_FORMAT)
+            except ValueError:
+                _logger.warning(
+                    "Failed to parse timestamp value: %s, trying using dateutil",
+                    timestamp_value,
+                )
+                return parse(timestamp_value, tzinfos={"UTC": timezone.utc}).replace(
+                    tzinfo=None
+                )
         elif isinstance(timestamp_value, datetime):
             # sql client returns already datetime object
             return timestamp_value
