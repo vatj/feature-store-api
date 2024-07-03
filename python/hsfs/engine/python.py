@@ -46,6 +46,8 @@ from typing import (
 if TYPE_CHECKING:
     import great_expectations
 
+import multiprocessing as mp
+
 import avro
 import boto3
 import hsfs
@@ -157,6 +159,115 @@ PYARROW_HOPSWORKS_DTYPE_MAPPING = {
     **dict.fromkeys(_DATE_TYPES, "date"),
     **dict.fromkeys(_BINARY_TYPES, "binary"),
 }
+
+
+def _get_kafka_config(kafka_connector, write_options):
+    config = kafka_connector.confluent_options()
+    if write_options is not None:
+        config.update(write_options.get("kafka_producer_config", {}))
+    return config
+
+
+def _get_encoder_func(writer_schema: str) -> callable:
+    if HAS_FAST:
+        schema = json.loads(writer_schema)
+        parsed_schema = parse_schema(schema)
+        return lambda record, outf: schemaless_writer(outf, parsed_schema, record)
+
+    parsed_schema = avro.schema.parse(writer_schema)
+    writer = avro.io.DatumWriter(parsed_schema)
+    return lambda record, outf: writer.write(record, avro.io.BinaryEncoder(outf))
+
+
+def _kafka_produce(
+    queue: mp.Queue,
+    topic_name: str,
+    acked: callable,
+    headers: Dict[str, bytes],
+    kafka_producer_config: Dict[str, Any],
+    debug_kafka: bool,
+) -> None:
+    producer = Producer(kafka_producer_config)
+    while True:
+        # if BufferError is thrown, we can be sure, message hasn't been send so we retry
+        try:
+            # produce
+            (key, encoded_row) = queue.get()
+            producer.produce(
+                topic=topic_name,
+                key=key,
+                value=encoded_row,
+                callback=acked,
+                headers=headers,
+            )
+
+            # Trigger internal callbacks to empty op queue
+            producer.poll(0)
+            break
+        except BufferError as e:
+            if debug_kafka:
+                print("Caught: {}".format(e))
+            # backoff for 1 second
+            producer.poll(1)
+
+
+def _encode_complex_features(
+    feature_writers: Dict[str, callable], row: Dict[str, Any]
+) -> Dict[str, Any]:
+    for feature_name, writer in feature_writers.items():
+        with BytesIO() as outf:
+            writer(row[feature_name], outf)
+            row[feature_name] = outf.getvalue()
+    return row
+
+
+def encode_rows(
+    row_iterator: Union[pd.DataFrame, pl.DataFrame],
+    queue: mp.Queue,
+    primary_key: List[str],
+    names_and_avro_schemas: List[Tuple[str, str]],
+    writer_schema: str,
+):
+    feature_writers = {
+        name: _get_encoder_func(avro_schema)
+        for (name, avro_schema) in names_and_avro_schemas
+    }
+    writer = _get_encoder_func(writer_schema)
+    # loop over rows
+    for row in row_iterator:
+        # itertuples returns Python NamedTyple, to be able to serialize it using
+        # avro, create copy of row only by converting to dict, which preserves datatypes
+        row = row._asdict()
+
+        # transform special data types
+        # here we might need to handle also timestamps and other complex types
+        # possible optimizaiton: make it based on type so we don't need to loop over
+        # all keys in the row
+        for k in row.keys():
+            # for avro to be able to serialize them, they need to be python data types
+            if isinstance(row[k], np.ndarray):
+                row[k] = row[k].tolist()
+            if isinstance(row[k], pd.Timestamp):
+                row[k] = row[k].to_pydatetime()
+            if isinstance(row[k], datetime) and row[k].tzinfo is None:
+                row[k] = row[k].replace(tzinfo=timezone.utc)
+            if isinstance(row[k], pd._libs.missing.NAType):
+                row[k] = None
+
+        # encode complex features
+        row = _encode_complex_features(feature_writers, row)
+
+        # encode feature row
+        with BytesIO() as outf:
+            writer(row, outf)
+            encoded_row = outf.getvalue()
+
+        # assemble key
+        key = "".join([str(row[pk]) for pk in sorted(primary_key)])
+
+        queue.put((key, encoded_row))
+
+        return None
 
 
 class Engine:
@@ -1344,7 +1455,11 @@ class Engine:
         dataframe: Union[pd.DataFrame, pl.DataFrame],
         offline_write_options: Dict[str, Any],
     ) -> Optional[job.Job]:
+        import multiprocessing as mp
+
+        queue = mp.Queue()
         initial_check_point = ""
+
         if feature_group._multi_part_insert:
             if feature_group._kafka_producer is None:
                 producer, feature_writers, writer = self._init_kafka_resources(
@@ -1395,42 +1510,63 @@ class Engine:
         else:
             row_iterator = dataframe.iter_rows(named=True)
 
-        # loop over rows
-        for row in row_iterator:
-            if isinstance(dataframe, pd.DataFrame):
-                # itertuples returns Python NamedTyple, to be able to serialize it using
-                # avro, create copy of row only by converting to dict, which preserves datatypes
-                row = row._asdict()
+        primary_key = feature_group.primary_key
+        names_and_avro_schemas = [
+            (feature.name, feature_group._get_feature_avro_schema(feature.name))
+            for feature in feature_group.features
+            if feature.is_complex()
+        ]
+        encode_process = mp.Process(
+            target=encode_rows,
+            args=(
+                row_iterator,
+                queue,
+                primary_key,
+                names_and_avro_schemas,
+            ),
+            name="encoder",
+        )
 
-                # transform special data types
-                # here we might need to handle also timestamps and other complex types
-                # possible optimizaiton: make it based on type so we don't need to loop over
-                # all keys in the row
-                for k in row.keys():
-                    # for avro to be able to serialize them, they need to be python data types
-                    if isinstance(row[k], np.ndarray):
-                        row[k] = row[k].tolist()
-                    if isinstance(row[k], pd.Timestamp):
-                        row[k] = row[k].to_pydatetime()
-                    if isinstance(row[k], datetime) and row[k].tzinfo is None:
-                        row[k] = row[k].replace(tzinfo=timezone.utc)
-                    if isinstance(row[k], pd._libs.missing.NAType):
-                        row[k] = None
+        kafka_config = self._get_kafka_config(
+            feature_store_id=feature_group.feature_store_id,
+            write_options=offline_write_options,
+        )
+        headers = {
+            "projectId": str(feature_group.feature_store.project_id).encode("utf8"),
+            "featureGroupId": str(feature_group._id).encode("utf8"),
+            "subjectId": str(feature_group.subject["id"]).encode("utf8"),
+        }
+        produce_process_1 = mp.Process(
+            target=_kafka_produce,
+            args=(
+                queue,
+                feature_group._online_topic_name,
+                acked,
+                headers,
+                kafka_config,
+                True,
+            ),
+            name="producer_1",
+        )
+        produce_process_2 = mp.Process(
+            target=_kafka_produce,
+            args=(
+                queue,
+                feature_group._online_topic_name,
+                acked,
+                headers,
+                kafka_config,
+                True,
+            ),
+            name="producer_2",
+        )
+        encode_process.start()
+        produce_process_1.start()
+        produce_process_2.start()
 
-            # encode complex features
-            row = self._encode_complex_features(feature_writers, row)
-
-            # encode feature row
-            with BytesIO() as outf:
-                writer(row, outf)
-                encoded_row = outf.getvalue()
-
-            # assemble key
-            key = "".join([str(row[pk]) for pk in sorted(feature_group.primary_key)])
-
-            self._kafka_produce(
-                producer, feature_group, key, encoded_row, acked, offline_write_options
-            )
+        encode_process.join()
+        produce_process_1.join()
+        produce_process_2.join()
 
         # make sure producer blocks and everything is delivered
         if not feature_group._multi_part_insert:
@@ -1541,15 +1677,6 @@ class Engine:
                     print("Caught: {}".format(e))
                 # backoff for 1 second
                 producer.poll(1)
-
-    def _encode_complex_features(
-        self, feature_writers: Dict[str, callable], row: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        for feature_name, writer in feature_writers.items():
-            with BytesIO() as outf:
-                writer(row[feature_name], outf)
-                row[feature_name] = outf.getvalue()
-        return row
 
     def _get_encoder_func(self, writer_schema: str) -> callable:
         if HAS_FAST:
